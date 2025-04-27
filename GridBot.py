@@ -9,41 +9,34 @@ from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 def setup(base_url=None, skip_ws=False):
-    print("Connect account...")
-    # API_KEY
-    account: LocalAccount = eth_account.Account.from_key("")
-    # Wallet Address if it's correct address it should show your current balance
-    address = ""
+    print("Connecting account...")
+    account: LocalAccount = eth_account.Account.from_key("")  # 🔐 your private key
+    address = ""  # your address
+
     if address == "":
         address = account.address
-    print("Running with account address:", address)
 
-    if address != account.address:
-        print("Running with agent address:", account.address)
+    print(f"Running with address: {address}")
     info = Info(base_url, skip_ws)
-    # user_state = info.user_state(address)
     spot_user_state = info.spot_user_state(address)
-    print('spot_user_state: ', spot_user_state)
+    print(f"Spot balances: {spot_user_state['balances']}")
 
-    for spot_data in spot_user_state["balances"]:
-      if spot_data['total'] != '0':
-          print(f"Coin: {spot_data['coin']}, Total: {spot_data['total']}")
-      else:
-          error_string = f"No account value found on spot."
-          raise Exception(error_string)
+    if not any(float(b['total']) > 0 for b in spot_user_state["balances"]):
+        raise Exception("No spot balance found.")
 
     exchange = Exchange(account, base_url, account_address=address)
     return address, info, exchange
 
-# Thanks to @timebaseline for grid bot strategy
 class GridTrading:
     def __init__(self, address, info, exchange, COIN, gridnum, gridmax, gridmin, tp, eachgridamount, hasspot=False):
         self.address = address
         self.info = info
         self.exchange = exchange
         self.COIN = COIN
+        self.symbol = f"{COIN}/USDC"
         self.gridnum = gridnum
         self.gridmax = gridmax
         self.gridmin = gridmin
@@ -57,80 +50,103 @@ class GridTrading:
     def compute(self):
         pricestep = (self.gridmax - self.gridmin) / self.gridnum
         self.eachprice = [round(self.gridmin + i * pricestep, 6) for i in range(self.gridnum)]
-        logger.info(f"Each grid's price: {self.eachprice}")
+        print(f"Grid levels: {self.eachprice}")
 
-        midprice = float(self.info.all_mids()[self.COIN][:-1])
-        print('Midprice: ', midprice)
-        print('Grid price: ', self.eachprice)
-        print('coin: ', self.COIN)
+        try:
+            midprice = float(self.info.all_mids()[self.COIN])
+        except Exception as e:
+            logger.error(f"Error fetching midprice: {e}")
+            return
+
+        print(f"Midprice: {midprice}")
+
         for i, price in enumerate(self.eachprice):
             if price > midprice:
                 self.buy_orders.append({"index": i, "oid": 0, "activated": False})
                 continue
-            order_result = self.exchange.order(self.COIN, True, self.eachgridamount, price, {"limit": {"tif": "Gtc"}})
+
+            order_result = self.exchange.order(self.symbol, True, self.eachgridamount, price, {"limit": {"tif": "Gtc"}})
 
             if order_result.get("status") == "ok":
-              # Check if there is an error in the statuses
-              statuses = order_result["response"]["data"].get("statuses", [])
-              
-              # Loop through the statuses and check for an error
-              error_found = False
-              for status in statuses:
-                  if 'error' in status:
-                      print(f"Error: {status['error']}")
-                      error_found = True
-                      break  # Stop checking once an error is found
-
-              if not error_found:
-                  # If no error found, proceed with the normal order processing
-                  print(f"Open order buy price: {midprice}, status: {order_result.get('status')}")
-                  buy_oid = order_result["response"]["data"]["statuses"][0].get("resting", {}).get("oid", 0)
-                  self.buy_orders.append({"index": i, "oid": buy_oid, "activated": True})
-              else:
-                  # If an error was found, you can handle it differently or skip this order
-                  print("Order could not be processed due to the error.")
+                statuses = order_result["response"]["data"].get("statuses", [])
+                for status in statuses:
+                    if "error" in status:
+                        logger.warning(f"Error placing buy order: {status['error']}")
+                        break
+                else:
+                    oid = statuses[0].get("resting", {}).get("oid", 0)
+                    print(f"✅ Buy order placed at {price}, oid: {oid}")
+                    self.buy_orders.append({"index": i, "oid": oid, "activated": True})
+            else:
+                logger.error(f"❌ Buy order failed: {order_result}")
 
     def check_orders(self):
+        # Check buy orders
         for buy_order in self.buy_orders[:]:
             if buy_order["activated"]:
                 order_status = self.info.query_order_by_oid(self.address, buy_order["oid"])
-                if order_status.get("order", {}).get("status") == "filled":
-                    sell_price = self.eachprice[buy_order["index"]] + self.tp
-                    sell_order_result = self.exchange.order(self.COIN, False, self.eachgridamount, sell_price, {"limit": {"tif": "Gtc"}})
-                    if sell_order_result.get("status") == "ok":
-                        print(f"Open order sell price: {sell_price}, status: {sell_order_result.get('status')}")
-                        sell_oid = sell_order_result["response"]["data"]["statuses"][0].get("resting", {}).get("oid", 0)
-                        self.sell_orders.append({"index": buy_order["index"], "oid": sell_oid, "activated": True})
+                order_data = order_status.get("order", {})
+                if order_data.get("status") == "filled":
+                    sell_price = round(self.eachprice[buy_order["index"]] + self.tp, 6)
+                    sell_result = self.exchange.order(self.symbol, False, self.eachgridamount, sell_price, {"limit": {"tif": "Gtc"}})
+
+                    if sell_result.get("status") == "ok":
+                        statuses = sell_result["response"]["data"].get("statuses", [])
+                        oid = statuses[0].get("resting", {}).get("oid", 0)
+                        print(f"✅ Sell order placed at {sell_price}, oid: {oid}")
+                        self.sell_orders.append({"index": buy_order["index"], "oid": oid, "activated": True})
                         self.buy_orders.remove(buy_order)
+                    else:
+                        logger.error(f"❌ Sell order failed: {sell_result}")
+
+        # Check sell orders
+        for sell_order in self.sell_orders[:]:
+            if sell_order["activated"]:
+                order_status = self.info.query_order_by_oid(self.address, sell_order["oid"])
+                order_data = order_status.get("order", {})
+                if order_data.get("status") == "filled":
+                    buy_price = self.eachprice[sell_order["index"]]
+                    buy_result = self.exchange.order(self.symbol, True, self.eachgridamount, buy_price, {"limit": {"tif": "Gtc"}})
+
+                    if buy_result.get("status") == "ok":
+                        statuses = buy_result["response"]["data"].get("statuses", [])
+                        oid = statuses[0].get("resting", {}).get("oid", 0)
+                        print(f"🔁 Buy order re-placed at {buy_price}, oid: {oid}")
+                        self.buy_orders.append({"index": sell_order["index"], "oid": oid, "activated": True})
+                        self.sell_orders.remove(sell_order)
+                    else:
+                        logger.error(f"❌ Re-buy order failed: {buy_result}")
 
     def trader(self):
         self.check_orders()
 
 def main():
-    # mainnet api config
     address, info, exchange = setup(base_url=constants.MAINNET_API_URL, skip_ws=True)
-    
-    # testnet api config
-    # address, info, exchange = setup(constants.TESTNET_API_URL, skip_ws=True)
-    
-    # Get the user state and print out position information
-    user_state = info.user_state(address)
-    positions = []
-    for position in user_state["assetPositions"]:
-        positions.append(position["position"])
-    if len(positions) > 0:
-        print("positions:")
-        for position in positions:
-            print(json.dumps(position, indent=2))
-    else:
-        print("no open positions")
 
-    # change token name, total grid step, grid max price length, grid min price length, tp price from position, size based on token not usdc
-    trading = GridTrading(address, info, exchange, "HYPE", 10, 21.2, 18.5, 0.01, 0.7, hasspot=False)
+    user_state = info.user_state(address)
+    positions = user_state.get("assetPositions", [])
+    if positions:
+        print("Open positions:")
+        for position in positions:
+            print(json.dumps(position["position"], indent=2))
+    else:
+        print("No open positions.")
+
+    trading = GridTrading(
+        address, info, exchange,
+        COIN="HYPE",  # change this to your desired coin
+        gridnum=10,
+        gridmax=18.10,
+        gridmin=17.35,
+        tp=0.2,
+        eachgridamount=0.6,
+        hasspot=True
+    )
+
     trading.compute()
     while True:
         trading.trader()
-        time.sleep(1)
+        time.sleep(2)
 
 if __name__ == "__main__":
     main()
